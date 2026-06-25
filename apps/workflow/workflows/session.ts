@@ -42,6 +42,7 @@ import {
   JOB_TIMEOUT,
   MAX_QUESTION_ROUNDS,
   MAX_REVISION_ROUNDS,
+  MAX_EXECUTE_ROUNDS,
   SWEEP_NUDGE_AFTER,
   SWEEP_REAP_AFTER,
 } from "@/lib/limits";
@@ -160,6 +161,32 @@ async function reapWorktree(linearSessionId: string): Promise<void> {
 async function classifyIntentStep(payload: { text: string; selectValue?: string }): Promise<"approve" | "revise"> {
   "use step";
   return classifyIntent(payload);
+}
+
+// Post-execution elicitation: surface the PR + result and ask the user to Mark complete or Request
+// changes. A step so it fires exactly once per round (not re-run on replay).
+async function sendExecuteElicitation(linearSessionId: string, done: JobDoneHookPayloadT): Promise<void> {
+  "use step";
+  if (done.prUrl) {
+    await setExternalUrls(linearSessionId, [{ label: "Pull Request", url: done.prUrl }]);
+  }
+  const summary = done.planSummary?.trim() ? `${done.planSummary.trim()}\n\n` : "";
+  const prLine = done.prUrl ? `Pull request: ${done.prUrl}\n\n` : "";
+  const body = `${summary}${prLine}**Mark complete** if this looks good, or **Request changes** (or just reply) with what to adjust.`;
+  await emitElicitationSelect(linearSessionId, body, [
+    { label: "Mark complete", value: "complete" },
+    { label: "Request changes", value: "request_changes" },
+  ]);
+}
+
+// Classify the response to a post-execution elicitation. The "Mark complete" button is the explicit
+// completion path; "Request changes" or any other reply means another round (free text runs through
+// the approve/revise classifier so "looks good, ship it" also completes).
+async function classifyExecuteIntentStep(payload: { text: string; selectValue?: string }): Promise<"complete" | "revise"> {
+  "use step";
+  if (payload.selectValue === "complete") return "complete";
+  if (payload.selectValue === "request_changes") return "revise";
+  return (await classifyIntent(payload)) === "approve" ? "complete" : "revise";
 }
 
 // Emit one elicitation for an AgentQuestion (rendering logic lives in lib/questions.ts). IO step.
@@ -511,9 +538,11 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
     claudeSessionId = done.claudeSessionId ?? claudeSessionId;
   }
 
-  // EXECUTE
-  const execJob = await startMiniJob({ kind: "execute", round: 0, input, claudeSessionId });
-  const execSettled = await settleJobOutcome(
+  // EXECUTE + implementation loop: implement, then let the user iterate ("Request changes") until
+  // they "Mark complete". Each revise round resumes the same Claude session and updates the PR.
+  let execRound = 0;
+  let execJob = await startMiniJob({ kind: "execute", round: execRound, input, claudeSessionId });
+  let execSettled = await settleJobOutcome(
     await waitForJob(execJob.jobId, input.linearSessionId, { withStop: true }),
     {
       jobId: execJob.jobId,
@@ -523,5 +552,41 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
     },
   );
   if (execSettled.kind === "returned") return;
-  await finalizeSuccess(input.linearSessionId, execSettled.done);
+  done = execSettled.done;
+  claudeSessionId = done.claudeSessionId ?? claudeSessionId;
+
+  while (true) {
+    await sendExecuteElicitation(input.linearSessionId, done);
+    const msg = await waitForPromptWithSweeper(input.linearSessionId);
+    if (msg.kind === "stop") {
+      await finalizeStop(input.linearSessionId);
+      return;
+    }
+    if ((await classifyExecuteIntentStep(msg.value)) === "complete") break;
+
+    execRound += 1;
+    if (execRound > MAX_EXECUTE_ROUNDS) {
+      await finalizeError(
+        input.linearSessionId,
+        `Reached the maximum of ${MAX_EXECUTE_ROUNDS} implementation rounds. Closing this session — re-delegate to continue.`,
+      );
+      return;
+    }
+
+    execJob = await startMiniJob({ kind: "execute", round: execRound, input, feedback: msg.value.text, claudeSessionId });
+    execSettled = await settleJobOutcome(
+      await waitForJob(execJob.jobId, input.linearSessionId, { withStop: true }),
+      {
+        jobId: execJob.jobId,
+        linearSessionId: input.linearSessionId,
+        phase: "Implementation",
+        timeoutMessage: "The implementation job timed out. Check the mini's logs.",
+      },
+    );
+    if (execSettled.kind === "returned") return;
+    done = execSettled.done;
+    claudeSessionId = done.claudeSessionId ?? claudeSessionId;
+  }
+
+  await finalizeSuccess(input.linearSessionId, done);
 }

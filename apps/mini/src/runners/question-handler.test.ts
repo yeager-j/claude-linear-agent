@@ -100,6 +100,25 @@ describe("makeCanUseTool", () => {
     const res = await handler(ASK(), { questions: "not-an-array" });
     expect(res.behavior).toBe("deny");
   });
+
+  test("ExitPlanMode (plan phase) captures the plan and DENIES, keeping the run in plan mode", async () => {
+    let captured: string | undefined;
+    const handler = makeCanUseTool(fakeJob(), new AbortController().signal, {
+      sendQuestion: async () => {},
+      onExitPlan: (plan) => {
+        captured = plan;
+      },
+    });
+    const res = await handler("ExitPlanMode", { plan: "1. do X\n2. do Y" });
+    expect(res.behavior).toBe("deny");
+    expect(captured).toBe("1. do X\n2. do Y");
+  });
+
+  test("ExitPlanMode without onExitPlan (execute phase) is allowed through", async () => {
+    const handler = makeCanUseTool(fakeJob(), new AbortController().signal, { sendQuestion: async () => {} });
+    const res = await handler("ExitPlanMode", { plan: "whatever" });
+    expect(res).toEqual({ behavior: "allow", updatedInput: { plan: "whatever" } });
+  });
 });
 
 // Helper so the literal tool name appears once.

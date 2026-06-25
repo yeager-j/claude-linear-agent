@@ -8,6 +8,9 @@ export const WEBHOOK_MAX_AGE_MS = 60_000;
 // Loop / lifecycle caps (plan §7 — a MAX_REVISION_ROUNDS-style cap on every workflow loop).
 export const MAX_REVISION_ROUNDS = 8;
 
+// Cap on post-execution implementation rounds (the user iterating "Request changes" on the PR).
+export const MAX_EXECUTE_ROUNDS = 8;
+
 // Cap on mid-run AskUserQuestion rounds per job, so a misbehaving agent that asks endlessly
 // can't loop the workflow forever.
 export const MAX_QUESTION_ROUNDS = 20;

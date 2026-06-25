@@ -75,10 +75,45 @@ export async function pushAndOpenPr(input: OpenPrInput): Promise<OpenPrResult> {
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    // A PR already exists for this branch (revise rounds push more commits to it) → GitHub 422s.
+    // Reuse the existing PR instead of failing.
+    if (res.status === 422) {
+      const existing = await getOpenPrUrl(input.owner, input.repo, input.branch, fetchImpl);
+      if (existing) {
+        log.info("PR already exists; updated branch", { prUrl: existing, branch: input.branch });
+        return { prUrl: existing, branch: input.branch };
+      }
+    }
     throw new Error(`GitHub PR create failed: ${res.status} ${text.slice(0, 300)}`);
   }
   const json = (await res.json()) as { html_url?: string };
   if (!json.html_url) throw new Error("GitHub PR response missing html_url");
   log.info("opened PR", { prUrl: json.html_url, branch: input.branch });
   return { prUrl: json.html_url, branch: input.branch };
+}
+
+// Look up the open PR for a branch (used when a revise round produced no new commits, or when
+// create returns "already exists"). Returns the PR url or null.
+export async function getOpenPrUrl(
+  owner: string,
+  repo: string,
+  branch: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  const cfg = config();
+  if (cfg.prDryRun) return `https://github.com/${owner}/${repo}/pull/0`;
+  if (!cfg.githubToken) return null;
+  const res = await fetchImpl(
+    `${cfg.githubApiUrl}/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(branch)}&state=open`,
+    {
+      headers: {
+        Authorization: `Bearer ${cfg.githubToken}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    },
+  );
+  if (!res.ok) return null;
+  const arr = (await res.json().catch(() => [])) as Array<{ html_url?: string }>;
+  return arr[0]?.html_url ?? null;
 }

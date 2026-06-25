@@ -1,4 +1,4 @@
-// @linear-agent/contract — THE SEAM, single source of truth.
+// @workspace/contract — THE SEAM, single source of truth.
 //
 // These schemas, the CONTRACT_VERSION, and the token helpers are the binding interface
 // between linear-agent-vercel (state machine) and linear-agent-mini (execution appliance).

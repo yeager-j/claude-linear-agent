@@ -17,6 +17,7 @@ import { bridgeStream } from "../activity-bridge.ts";
 import { runnerDeps } from "./deps.ts";
 import { getJobToken } from "../job-tokens.ts";
 import { makeCanUseTool } from "./question-handler.ts";
+import { installDeps } from "./install-deps.ts";
 import { log } from "../log.ts";
 
 // "AskUserQuestion" MUST be allowlisted for mid-run HITL to fire via canUseTool.
@@ -72,6 +73,9 @@ export async function runPlan(ctx: RunnerContext): Promise<RunnerResult> {
     database: d,
   });
 
+  // Install deps so the agent can run typechecks/tests while investigating.
+  await installDeps(ws.worktreePath);
+
   const isRevise = job.kind === "revise";
   const resume = isRevise
     ? job.claude_session_id ?? latestClaudeSessionId(d, job.linear_session_id) ?? undefined
@@ -79,6 +83,10 @@ export async function runPlan(ctx: RunnerContext): Promise<RunnerResult> {
   const prompt = isRevise ? buildRevisePrompt(job.feedback ?? "") : buildPlanPrompt(job.prompt_context);
 
   await linear.thought(job.linear_session_id, isRevise ? "Revising the plan…" : "Investigating the issue…", true);
+
+  // Set when the agent presents its plan via ExitPlanMode (the approval gate). A captured plan means
+  // the plan phase succeeded with that plan; the run stays read-only and never implements.
+  let capturedPlan: string | undefined;
 
   const abortController = new AbortController();
   const onAbort = () => abortController.abort();
@@ -92,7 +100,12 @@ export async function runPlan(ctx: RunnerContext): Promise<RunnerResult> {
       allowedTools: PLAN_ALLOWED_TOOLS,
       resume,
       abortController,
-      canUseTool: makeCanUseTool(job, signal, { sendQuestion: deps.sendQuestion }),
+      canUseTool: makeCanUseTool(job, signal, {
+        sendQuestion: deps.sendQuestion,
+        onExitPlan: (plan) => {
+          capturedPlan = plan;
+        },
+      }),
     });
 
     const outcome = await bridgeStream(stream, {
@@ -103,6 +116,15 @@ export async function runPlan(ctx: RunnerContext): Promise<RunnerResult> {
 
     if (signal.aborted) {
       return { status: "aborted", reason: "aborted", claudeSessionId: outcome.claudeSessionId };
+    }
+    // The agent presented its plan via ExitPlanMode — a successful plan (we denied the tool only to
+    // keep it from implementing). Prefer the structured plan; fall back to the run's final text.
+    if (capturedPlan !== undefined) {
+      return {
+        status: "succeeded",
+        claudeSessionId: outcome.claudeSessionId,
+        planSummary: capturedPlan.trim() || outcome.resultText || "",
+      };
     }
     if (outcome.isError) {
       return {

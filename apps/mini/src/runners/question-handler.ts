@@ -1,7 +1,11 @@
-// Builds the canUseTool handler for a job. On an AskUserQuestion tool call it pauses the run,
-// asks Vercel to elicit the answer(s) in Linear, awaits them, and returns them to the SDK as
-// updatedInput.answers. Every other tool is allowed through unchanged (the permissionMode +
-// allowedTools allowlist already governs what the agent may do).
+// Builds the canUseTool handler for a job. Two interceptions:
+//   - AskUserQuestion: pause the run, ask Vercel to elicit the answer(s) in Linear, await them,
+//     and return them to the SDK as updatedInput.answers.
+//   - ExitPlanMode (plan/revise phase only, when onExitPlan is provided): the agent presenting its
+//     plan is the APPROVAL GATE. We capture the plan and DENY the tool so the agent never leaves
+//     plan mode — otherwise canUseTool's blanket "allow" lets it exit plan mode and implement
+//     inside the plan job, defeating the gate. Execution happens in a separate job after approval.
+// Every other tool is allowed through unchanged (permissionMode + allowedTools govern the rest).
 //
 // Blocking semantics: the SDK's canUseTool is async with no timeout, so awaiting the answer here
 // is exactly how the run "pauses". If the job is aborted, rejectQuestionsForJob() (called from
@@ -18,6 +22,7 @@ import { sendQuestion } from "../question-client.ts";
 import { log } from "../log.ts";
 
 const ASK_USER_QUESTION = "AskUserQuestion";
+const EXIT_PLAN_MODE = "ExitPlanMode";
 
 // Injectable so tests can stub the network. Mirrors sendQuestion's signature.
 export type SendQuestionFn = typeof sendQuestion;
@@ -26,12 +31,27 @@ const QuestionsInput = z.object({ questions: z.array(AgentQuestion).min(1) });
 
 export interface QuestionHandlerDeps {
   sendQuestion?: SendQuestionFn;
+  // Plan/revise phase only: called with the agent's plan when it invokes ExitPlanMode. Providing
+  // this makes the handler DENY ExitPlanMode (keeping the run in read-only plan mode) so the plan
+  // is the gate; the execute job implements it after the user approves.
+  onExitPlan?: (plan: string) => void;
 }
 
 export function makeCanUseTool(job: JobRow, signal: AbortSignal, deps: QuestionHandlerDeps = {}): CanUseToolFn {
   const send = deps.sendQuestion ?? sendQuestion;
 
   return async (toolName, input) => {
+    // Plan/revise gate: capture the plan and keep the agent in plan mode (deny). Without this the
+    // blanket "allow" below lets the agent exit plan mode and implement inside the plan job.
+    if (toolName === EXIT_PLAN_MODE && deps.onExitPlan) {
+      const raw = (input as { plan?: unknown }).plan;
+      deps.onExitPlan(typeof raw === "string" ? raw : "");
+      return {
+        behavior: "deny",
+        message: "Plan recorded for review. Do not implement — wait for the user's approval.",
+      };
+    }
+
     if (toolName !== ASK_USER_QUESTION) {
       return { behavior: "allow", updatedInput: input };
     }

@@ -21,13 +21,24 @@ import { bridgeStream } from "../activity-bridge.ts";
 import { runnerDeps } from "./deps.ts";
 import { getJobToken } from "../job-tokens.ts";
 import { makeCanUseTool } from "./question-handler.ts";
-import { parseOwnerRepo, pushAndOpenPr } from "../github/pr.ts";
+import { installDeps } from "./install-deps.ts";
+import { parseOwnerRepo, pushAndOpenPr, getOpenPrUrl } from "../github/pr.ts";
 import { log } from "../log.ts";
 
 // "AskUserQuestion" MUST be allowlisted for mid-run HITL to fire via canUseTool.
 const EXECUTE_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch", "AskUserQuestion"];
 
-function buildExecutePrompt(promptContext: string | null): string {
+function buildExecutePrompt(promptContext: string | null, feedback: string | null): string {
+  if (feedback) {
+    return [
+      "The user reviewed your implementation and asked for changes. Update the working tree accordingly.",
+      "Run any relevant checks/tests. Do NOT commit, push, or open a PR — the harness handles git.",
+      "When done, briefly summarize what you changed in this round.",
+      "",
+      "Requested changes:",
+      feedback,
+    ].join("\n");
+  }
   return [
     "You are now EXECUTING the approved plan for a Linear-delegated issue.",
     "Make the changes in this working tree. Run any relevant checks/tests.",
@@ -76,9 +87,16 @@ export async function runExecute(ctx: RunnerContext): Promise<RunnerResult> {
     database: d,
   });
 
+  // Install deps so the agent can run checks/tests immediately instead of spending a turn on it.
+  await installDeps(ws.worktreePath);
+
   const resume = job.claude_session_id ?? latestClaudeSessionId(d, job.linear_session_id) ?? undefined;
 
-  await linear.thought(job.linear_session_id, "Implementing the approved plan…", true);
+  await linear.thought(
+    job.linear_session_id,
+    job.feedback ? "Applying your requested changes…" : "Implementing the approved plan…",
+    true,
+  );
 
   if (cfg.useContainer) {
     // TODO(Phase 6 hardening): run the SDK inside an OrbStack container for isolation +
@@ -95,7 +113,7 @@ export async function runExecute(ctx: RunnerContext): Promise<RunnerResult> {
   let claudeSessionId: string | undefined = resume;
   try {
     const stream = deps.query({
-      prompt: buildExecutePrompt(job.prompt_context),
+      prompt: buildExecutePrompt(job.prompt_context, job.feedback),
       cwd: ws.worktreePath,
       permissionMode: "dontAsk",
       allowedTools: EXECUTE_ALLOWED_TOOLS,
@@ -116,9 +134,17 @@ export async function runExecute(ctx: RunnerContext): Promise<RunnerResult> {
       return { status: "failed", reason: outcome.resultText ?? "execute run failed", claudeSessionId };
     }
 
-    // Commit + push + PR.
+    // Commit + push + PR (idempotent across rounds: a revise round force-updates the same branch
+    // and reuses the existing PR).
     const committed = await commitChanges(ws.worktreePath, job.issue_identifier);
     if (!committed) {
+      // A revise round can legitimately produce no new changes (e.g. the agent explains why it
+      // didn't change anything). Keep the existing PR rather than failing. A round-0 run with no
+      // changes is still a failure.
+      if (job.feedback) {
+        const prUrl = (await getOpenPrUrl(ownerRepo.owner, ownerRepo.repo, ws.branch)) ?? undefined;
+        return { status: "succeeded", claudeSessionId, prUrl, branch: ws.branch, planSummary: outcome.resultText ?? undefined };
+      }
       return {
         status: "failed",
         reason: "no changes were produced by the execute run",
