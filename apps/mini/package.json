@@ -1,0 +1,25 @@
+{
+  "name": "linear-agent-mini",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun index.ts",
+    "dev": "bun --hot index.ts",
+    "test": "bun test",
+    "mutation": "stryker run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1",
+    "@types/node": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.178",
+    "@workspace/contract": "*",
+    "zod": "^4.4.3"
+  }
+}
