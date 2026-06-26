@@ -281,28 +281,31 @@ async function waitForJob(
 ): Promise<WaitJobResult> {
   using done = jobDoneHook.create({ token: jobDoneToken(jobId) });
   using question = questionHook.create({ token: questionToken(jobId) });
-  using stop = promptHook.create({ token: promptToken(linearSessionId) });
+  // ONE promptHook per session token — it serves BOTH the mid-run stop signal AND mid-run question
+  // answers (a `prompted` webhook resumes this token either way). Creating a SECOND promptHook for
+  // the same token to collect an answer throws HookConflictError, so answers are read from THIS
+  // hook, not a fresh one.
+  using prompt = promptHook.create({ token: promptToken(linearSessionId) });
 
-  // Long-lived iterators: calling .next() again yields the NEXT resume on the same registered
-  // hook, so the question hook is never unregistered between questions.
+  // Long-lived iterators: calling .next() again yields the NEXT resume on the same registered hook.
   const questionIter = question[Symbol.asyncIterator]();
-  const stopIter = stop[Symbol.asyncIterator]();
+  const promptIter = prompt[Symbol.asyncIterator]();
 
-  // Hoist each long-lived branch's pending promise OUTSIDE the loop. After a race, refresh ONLY
-  // the branch that resolved (the question branch) — never re-pull an iterator whose previous
-  // .next() is still pending, and never re-await a hook mid-flight. The losers stay pending and
-  // are reused on the next round. The timeout is a single budget for the whole wait.
   const doneBranch: Promise<RaceOutcome> = (async () => ({ kind: "done", value: await done }))();
   const timeoutBranch: Promise<RaceOutcome> = sleep(JOB_TIMEOUT).then(() => ({ kind: "timeout" }));
 
-  // Resolve on the NEXT promptHook event: a stop short-circuits the wait; any other (non-stop)
-  // reply surfaces as "dropped" so the loop can acknowledge it to the user and re-arm — a stale
-  // non-stop value can't permanently win the race, and it's no longer silently discarded.
-  const nextStop = (): Promise<RaceOutcome> =>
-    (async (): Promise<RaceOutcome> => {
-      const { value, done: end } = await stopIter.next();
-      if (end || !value) return { kind: "timeout" };
-      return value.signal === "stop" ? { kind: "stop" } : { kind: "dropped" };
+  // The next promptHook event: a stop signal, or a reply carrying text/selectValue. The reply is
+  // used as a question answer when one is pending, otherwise acknowledged as a stray mid-run message.
+  type PromptOutcome =
+    | { kind: "stop" }
+    | { kind: "reply"; value: { text: string; selectValue?: string } }
+    | { kind: "exhausted" };
+  const nextPrompt = (): Promise<PromptOutcome> =>
+    (async (): Promise<PromptOutcome> => {
+      const { value, done: end } = await promptIter.next();
+      if (end || !value) return { kind: "exhausted" };
+      if (value.signal === "stop") return { kind: "stop" };
+      return { kind: "reply", value: { text: value.text, selectValue: value.selectValue } };
     })();
 
   const nextQuestion = (): Promise<RaceOutcome> =>
@@ -317,36 +320,41 @@ async function waitForJob(
       };
     })();
 
-  let stopBranch: Promise<RaceOutcome> = opts.withStop
-    ? nextStop()
-    : new Promise<RaceOutcome>(() => {}); // never resolves when stop isn't wanted
+  // never-resolving stand-in when stop isn't wanted
+  let promptBranch: Promise<PromptOutcome> = opts.withStop ? nextPrompt() : new Promise<PromptOutcome>(() => {});
   let questionBranch = nextQuestion();
   let questionRounds = 0;
   while (true) {
+    // Map the pending prompt event into the race: stop short-circuits; a stray reply mid-run (no
+    // question pending) is "dropped"; iterator end → timeout.
+    const promptRace: Promise<RaceOutcome> = promptBranch.then((p): RaceOutcome =>
+      p.kind === "stop" ? { kind: "stop" } : p.kind === "exhausted" ? { kind: "timeout" } : { kind: "dropped" },
+    );
+
     // MUST `await` inside the `using` scope — a bare `return Promise.race(...)` would dispose the
     // hooks the instant the race is built, before any resume can land.
-    const outcome = await Promise.race([doneBranch, questionBranch, stopBranch, timeoutBranch]);
+    const outcome = await Promise.race([doneBranch, questionBranch, promptRace, timeoutBranch]);
 
     if (outcome.kind === "done") return { kind: "done", value: outcome.value };
     if (outcome.kind === "stop") return { kind: "stop" };
     if (outcome.kind === "timeout") return { kind: "timeout" };
 
     if (outcome.kind === "dropped") {
-      // A reply landed mid-run. We can't act on it until the current step finishes; tell the user
-      // so their message isn't silently lost, then re-arm the stop branch and keep waiting.
+      // A reply landed mid-run with no question pending. Acknowledge so it isn't silently lost, then
+      // re-arm (the prior promptBranch already resolved) and keep waiting.
       console.warn(`[session] reply arrived during a running job; acknowledged and ignored`);
       await emitThoughtStep(
         linearSessionId,
         "I'm still working on the current step — I saw your message but can't act on it yet. " +
           "Please re-send it once I post the next update.",
       );
-      stopBranch = nextStop();
+      promptBranch = nextPrompt();
       continue;
     }
 
-    // outcome.kind === "question" — handle it WITHOUT disposing the question hook, so a second
-    // question that arrives during handling is buffered by the still-registered hook and picked
-    // up by the next questionIter.next() below.
+    // outcome.kind === "question" — collect the answer(s) through the SAME promptHook (no second
+    // hook). The agent run is paused on the mini until we deliver answers, so the job can't complete
+    // mid-question; JOB_TIMEOUT is the backstop for an unanswered question.
     questionRounds += 1;
     if (questionRounds > MAX_QUESTION_ROUNDS) {
       await emitThoughtStep(
@@ -356,38 +364,23 @@ async function waitForJob(
       return { kind: "timeout" };
     }
 
-    const asked = await askQuestionsViaLinear(linearSessionId, outcome.questions);
-    if (asked.kind === "stop") return { kind: "stop" };
-    await deliverAnswerStep(outcome.jobId, outcome.questionId, asked.answers);
+    const answers: Record<string, string> = {};
+    for (const q of outcome.questions) {
+      await emitQuestionStep(linearSessionId, q);
+      const ev = await Promise.race([promptBranch, timeoutBranch]);
+      if (ev.kind === "reply") {
+        answers[q.question] = answerFromReply(q, ev.value);
+        promptBranch = nextPrompt(); // re-arm for the next question / stop
+        continue;
+      }
+      if (ev.kind === "stop") return { kind: "stop" };
+      return { kind: "timeout" }; // timeout or exhausted
+    }
+    await deliverAnswerStep(outcome.jobId, outcome.questionId, answers);
 
-    // Re-arm ONLY the question branch; done/stop/timeout keep their pending promises.
+    // Re-arm ONLY the question branch; done/prompt/timeout keep their pending promises.
     questionBranch = nextQuestion();
   }
-}
-
-/* ───────────────────────── AskUserQuestion elicitation (workflow body helper) ─────────────────────────
- * Emits one elicitation per question, collects each answer (select value or free text), and builds
- * the answers map keyed by question text → chosen label(s). A stop reply propagates up so the
- * caller can abort the job. The per-question wait reuses the sweeper so an unanswered question
- * can't hang the run forever.
- */
-
-type AskResult = { kind: "answers"; answers: Record<string, string> } | { kind: "stop" };
-
-async function askQuestionsViaLinear(
-  linearSessionId: string,
-  questions: AgentQuestion[],
-): Promise<AskResult> {
-  const answers: Record<string, string> = {};
-  for (const q of questions) {
-    await emitQuestionStep(linearSessionId, q);
-    const reply = await waitForPromptWithSweeper(linearSessionId);
-    if (reply.kind === "stop") return { kind: "stop" };
-    // Normalized per the contract: single-select → option label; multiSelect → matched labels
-    // joined by ", " (fallback to raw text). Keyed by the question text.
-    answers[q.question] = answerFromReply(q, reply.value);
-  }
-  return { kind: "answers", answers };
 }
 
 type PromptResult =
