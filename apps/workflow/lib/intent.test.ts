@@ -1,10 +1,34 @@
 import { describe, expect, it } from "vitest";
-import { classifyIntent } from "./intent";
+import { classifyIntent, selectValueFrom } from "./intent";
+
+describe("selectValueFrom", () => {
+  it("prefers an explicit select value verbatim", () => {
+    expect(selectValueFrom({ text: "whatever", selectValue: "approve" })).toBe("approve");
+    expect(selectValueFrom({ text: "x", selectValue: "custom_value" })).toBe("custom_value");
+  });
+
+  it("recognizes a control value Linear delivered as the prompt text", () => {
+    // Linear sends a clicked option's `value` as the prompt body, not in a dedicated field.
+    expect(selectValueFrom({ text: "complete" })).toBe("complete");
+    expect(selectValueFrom({ text: "  Approve  " })).toBe("approve");
+    expect(selectValueFrom({ text: "request_changes" })).toBe("request_changes");
+  });
+
+  it("returns undefined for ordinary free text", () => {
+    expect(selectValueFrom({ text: "please change the title" })).toBeUndefined();
+    expect(selectValueFrom({ text: "" })).toBeUndefined();
+  });
+});
 
 describe("classifyIntent", () => {
   it("uses the select-button value as the primary path", () => {
     expect(classifyIntent({ text: "whatever", selectValue: "approve" })).toBe("approve");
     expect(classifyIntent({ text: "approve", selectValue: "request_changes" })).toBe("revise");
+  });
+
+  it("treats a control value delivered as prompt text like a button click", () => {
+    expect(classifyIntent({ text: "approve" })).toBe("approve");
+    expect(classifyIntent({ text: "request_changes" })).toBe("revise");
   });
 
   it("treats an unknown select value as a revision (safe default)", () => {

@@ -35,7 +35,7 @@ import {
   deliverAnswer,
   reapWorktree as reapMiniWorktree,
 } from "@/lib/mini";
-import { classifyIntent } from "@/lib/intent";
+import { classifyIntent, selectValueFrom } from "@/lib/intent";
 import { answerFromReply, renderQuestion } from "@/lib/questions";
 import {
   ABORT_GRACE,
@@ -133,12 +133,9 @@ async function sendElicitation(linearSessionId: string, planSummary?: string): P
   // vanish when the plan run goes terminal, so without this the user sees only the buttons.
   const plan = planSummary?.trim();
   const body = plan
-    ? `${plan}\n\n---\n\n**Approve** this plan to start work, or **Request changes** (or just reply) to tell me what to adjust.`
-    : "I've finished planning. Approve this plan, or describe the changes you'd like.";
-  await emitElicitationSelect(linearSessionId, body, [
-    { label: "Approve", value: "approve" },
-    { label: "Request changes", value: "request_changes" },
-  ]);
+    ? `${plan}\n\n---\n\n**Approve** this plan to start work, or just reply to tell me what to adjust.`
+    : "I've finished planning. Approve this plan, or reply with the changes you'd like.";
+  await emitElicitationSelect(linearSessionId, body, [{ label: "Approve", value: "approve" }]);
 }
 
 // Tell the mini to reap the worktree but keep the Claude session id (plan §7 sweeper).
@@ -163,8 +160,9 @@ async function classifyIntentStep(payload: { text: string; selectValue?: string 
   return classifyIntent(payload);
 }
 
-// Post-execution elicitation: surface the PR + result and ask the user to Mark complete or Request
-// changes. A step so it fires exactly once per round (not re-run on replay).
+// Post-execution elicitation: surface the PR + result and offer a single "Mark complete" button;
+// any other reply is treated as change feedback. A step so it fires exactly once per round (not
+// re-run on replay).
 async function sendExecuteElicitation(linearSessionId: string, done: JobDoneHookPayloadT): Promise<void> {
   "use step";
   if (done.prUrl) {
@@ -172,20 +170,19 @@ async function sendExecuteElicitation(linearSessionId: string, done: JobDoneHook
   }
   const summary = done.planSummary?.trim() ? `${done.planSummary.trim()}\n\n` : "";
   const prLine = done.prUrl ? `Pull request: ${done.prUrl}\n\n` : "";
-  const body = `${summary}${prLine}**Mark complete** if this looks good, or **Request changes** (or just reply) with what to adjust.`;
-  await emitElicitationSelect(linearSessionId, body, [
-    { label: "Mark complete", value: "complete" },
-    { label: "Request changes", value: "request_changes" },
-  ]);
+  const body = `${summary}${prLine}**Mark complete** if this looks good, or just reply with what to adjust.`;
+  await emitElicitationSelect(linearSessionId, body, [{ label: "Mark complete", value: "complete" }]);
 }
 
 // Classify the response to a post-execution elicitation. The "Mark complete" button is the explicit
-// completion path; "Request changes" or any other reply means another round (free text runs through
-// the approve/revise classifier so "looks good, ship it" also completes).
+// completion path (its value arrives via selectValueFrom whether Linear sends it as a select value
+// or as the prompt text); any free-text reply runs through the approve/revise classifier so
+// "looks good, ship it" also completes, while anything else is treated as change feedback.
 async function classifyExecuteIntentStep(payload: { text: string; selectValue?: string }): Promise<"complete" | "revise"> {
   "use step";
-  if (payload.selectValue === "complete") return "complete";
-  if (payload.selectValue === "request_changes") return "revise";
+  const selected = selectValueFrom(payload);
+  if (selected === "complete") return "complete";
+  if (selected === "request_changes") return "revise";
   return (await classifyIntent(payload)) === "approve" ? "complete" : "revise";
 }
 
@@ -531,8 +528,8 @@ export async function sessionWorkflow(input: SessionInput): Promise<void> {
     claudeSessionId = done.claudeSessionId ?? claudeSessionId;
   }
 
-  // EXECUTE + implementation loop: implement, then let the user iterate ("Request changes") until
-  // they "Mark complete". Each revise round resumes the same Claude session and updates the PR.
+  // EXECUTE + implementation loop: implement, then let the user iterate (just reply with changes)
+  // until they "Mark complete". Each revise round resumes the same Claude session and updates the PR.
   let execRound = 0;
   let execJob = await startMiniJob({ kind: "execute", round: execRound, input, claudeSessionId });
   let execSettled = await settleJobOutcome(
